@@ -249,6 +249,7 @@ where
         Box::pin(
             async move {
                 let (mut req, extracted_session_id) = id_extractor.extract(req).await;
+                let had_extracted_session_id = extracted_session_id.is_some();
 
                 let Some(cookies) = req.extensions().get::<_>().cloned() else {
                     // In practice this should never happen because we wrap `CookieManager`
@@ -256,8 +257,11 @@ where
                     tracing::error!("missing cookies request extension");
                     return Ok(Response::default());
                 };
+                let request_had_session_cookie =
+                    cookie_controller.get(&cookies, &session_config.name).is_some();
 
-                let session = Session::new(extracted_session_id, session_store, session_config.expiry);
+                let session =
+                    Session::new(extracted_session_id, session_store, session_config.expiry);
 
                 req.extensions_mut().insert(session.clone());
 
@@ -274,7 +278,7 @@ where
                 );
 
                 match session.id() {
-                    Some(_) if empty => {
+                    _ if empty && (had_extracted_session_id || request_had_session_cookie) => {
                         tracing::debug!("removing session cookie");
 
                         let mut cookie = Cookie::new(session_config.name.to_string(), "");
@@ -503,9 +507,9 @@ impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, 
     /// let session_store = MemoryStore::default();
     /// let session_service = SessionManagerLayer::new(session_store).with_id_extractor(
     ///     (),
-    ///     |state: (), request: Request<_>| async move {
+    ///     |state: (), request: Request<()>| async move {
     ///         let _ = state;
-    ///         (request, None)
+    ///         (request, None::<tower_sessions::session::Id>)
     ///     },
     /// );
     /// ```
