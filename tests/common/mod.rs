@@ -3,8 +3,8 @@ use axum_core::body::Body;
 use http::{header, HeaderMap};
 use http_body_util::BodyExt;
 use time::{Duration, OffsetDateTime};
-use tower_cookies::{cookie, Cookie};
-use tower_sessions::{Expiry, Session, SessionManagerLayer, SessionStore};
+use tower_cookies::{cookie, Cookie, Cookies};
+use tower_sessions::{session::Id, Expiry, Session, SessionManagerLayer, SessionStore};
 
 fn routes() -> Router {
     Router::new()
@@ -67,10 +67,12 @@ fn routes() -> Router {
 }
 
 pub fn build_app<Store: SessionStore + Clone>(
-    mut session_manager: SessionManagerLayer<Store>,
+    session_manager: SessionManagerLayer<Store>,
     max_age: Option<Duration>,
     domain: Option<String>,
 ) -> Router {
+    let mut session_manager = session_manager.with_id_extractor((), cookie_id_extractor);
+
     if let Some(max_age) = max_age {
         session_manager = session_manager.with_expiry(Expiry::OnInactivity(max_age));
     }
@@ -80,6 +82,22 @@ pub fn build_app<Store: SessionStore + Clone>(
     }
 
     routes().layer(session_manager)
+}
+
+async fn cookie_id_extractor<ReqBody>(
+    _: (),
+    req: http::Request<ReqBody>,
+) -> (http::Request<ReqBody>, Option<Id>)
+where
+    ReqBody: Send + 'static,
+{
+    let session_id = req
+        .extensions()
+        .get::<Cookies>()
+        .and_then(|cookies| cookies.get("id"))
+        .and_then(|cookie| cookie.value().parse::<Id>().ok());
+
+    (req, session_id)
 }
 
 pub async fn body_string(body: Body) -> String {

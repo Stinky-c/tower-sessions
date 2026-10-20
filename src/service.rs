@@ -143,11 +143,17 @@ impl Default for SessionConfig<'_> {
 
 /// A middleware that provides [`Session`] as a request extension.
 #[derive(Debug, Clone)]
-pub struct SessionManager<S, Store: SessionStore, C: CookieController = PlaintextCookie> {
+pub struct SessionManager<
+    S,
+    Store: SessionStore,
+    C: CookieController = PlaintextCookie,
+    I = NoopIdExtractor,
+> {
     inner: S,
     session_store: Arc<Store>,
     session_config: SessionConfig<'static>,
     cookie_controller: C,
+    id_extractor: I,
 }
 
 impl<S, Store: SessionStore> SessionManager<S, Store> {
@@ -158,12 +164,58 @@ impl<S, Store: SessionStore> SessionManager<S, Store> {
             session_store: Arc::new(session_store),
             session_config: Default::default(),
             cookie_controller: PlaintextCookie,
+            id_extractor: NoopIdExtractor,
         }
     }
 }
 
-impl<ReqBody, ResBody, S, Store: SessionStore, C: CookieController> Service<Request<ReqBody>>
-    for SessionManager<S, Store, C>
+/// An extractor callback for loading a [`session::Id`] from a request.
+pub trait IdExtractor<ReqBody>: Clone + Send + 'static {
+    /// The callback future.
+    type Future: Future<Output = (Request<ReqBody>, Option<session::Id>)> + Send + 'static;
+
+    /// Extract an ID from the request and return the request for continued processing.
+    fn extract(&self, request: Request<ReqBody>) -> Self::Future;
+}
+
+/// A default no-op ID extractor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopIdExtractor;
+
+impl<ReqBody> IdExtractor<ReqBody> for NoopIdExtractor
+where
+    ReqBody: Send + 'static,
+{
+    type Future = std::future::Ready<(Request<ReqBody>, Option<session::Id>)>;
+
+    fn extract(&self, request: Request<ReqBody>) -> Self::Future {
+        std::future::ready((request, None))
+    }
+}
+
+/// An ID extractor that receives both user state and request.
+#[derive(Debug, Clone)]
+pub struct StateIdExtractor<State, F> {
+    state: State,
+    extractor: F,
+}
+
+impl<ReqBody, State, F, Fut> IdExtractor<ReqBody> for StateIdExtractor<State, F>
+where
+    ReqBody: Send + 'static,
+    State: Clone + Send + 'static,
+    F: Fn(State, Request<ReqBody>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = (Request<ReqBody>, Option<session::Id>)> + Send + 'static,
+{
+    type Future = Fut;
+
+    fn extract(&self, request: Request<ReqBody>) -> Self::Future {
+        (self.extractor)(self.state.clone(), request)
+    }
+}
+
+impl<ReqBody, ResBody, S, Store: SessionStore, C: CookieController, I: IdExtractor<ReqBody>>
+    Service<Request<ReqBody>> for SessionManager<S, Store, C, I>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
@@ -179,12 +231,13 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let span = tracing::info_span!("call");
 
         let session_store = self.session_store.clone();
         let session_config = self.session_config.clone();
         let cookie_controller = self.cookie_controller.clone();
+        let id_extractor = self.id_extractor.clone();
 
         // Because the inner service can panic until ready, we need to ensure we only
         // use the ready service.
@@ -195,6 +248,8 @@ where
 
         Box::pin(
             async move {
+                let (mut req, extracted_session_id) = id_extractor.extract(req).await;
+
                 let Some(cookies) = req.extensions().get::<_>().cloned() else {
                     // In practice this should never happen because we wrap `CookieManager`
                     // directly.
@@ -202,21 +257,7 @@ where
                     return Ok(Response::default());
                 };
 
-                let session_cookie = cookie_controller.get(&cookies, &session_config.name);
-                let session_id = session_cookie.as_ref().and_then(|cookie| {
-                    cookie
-                        .value()
-                        .parse::<session::Id>()
-                        .map_err(|err| {
-                            tracing::warn!(
-                                err = %err,
-                                "possibly suspicious activity: malformed session id"
-                            )
-                        })
-                        .ok()
-                });
-
-                let session = Session::new(session_id, session_store, session_config.expiry);
+                let session = Session::new(extracted_session_id, session_store, session_config.expiry);
 
                 req.extensions_mut().insert(session.clone());
 
@@ -232,24 +273,17 @@ where
                     "session response state",
                 );
 
-                match session_cookie {
-                    Some(mut cookie) if empty => {
+                match session.id() {
+                    Some(_) if empty => {
                         tracing::debug!("removing session cookie");
 
-                        // Path and domain must be manually set to ensure a proper removal cookie is
-                        // constructed.
-                        //
-                        // See: https://docs.rs/cookie/latest/cookie/struct.CookieJar.html#method.remove
-                        cookie.set_path(session_config.path);
-                        if let Some(domain) = session_config.domain {
+                        let mut cookie = Cookie::new(session_config.name.to_string(), "");
+                        cookie.set_path(session_config.path.clone());
+                        if let Some(domain) = session_config.domain.clone() {
                             cookie.set_domain(domain);
                         }
-
-                        // Preserve the configured Secure and HttpOnly attributes. Otherwise
-                        // `__Host-`/`__Secure-`-prefixed cookies without Secure may be rejected.
                         cookie.set_secure(session_config.secure);
                         cookie.set_http_only(session_config.http_only);
-
                         cookie_controller.remove(&cookies, cookie);
                     }
 
@@ -293,13 +327,18 @@ where
 
 /// A layer for providing [`Session`] as a request extension.
 #[derive(Debug, Clone)]
-pub struct SessionManagerLayer<Store: SessionStore, C: CookieController = PlaintextCookie> {
+pub struct SessionManagerLayer<
+    Store: SessionStore,
+    C: CookieController = PlaintextCookie,
+    I = NoopIdExtractor,
+> {
     session_store: Arc<Store>,
     session_config: SessionConfig<'static>,
     cookie_controller: C,
+    id_extractor: I,
 }
 
-impl<Store: SessionStore, C: CookieController> SessionManagerLayer<Store, C> {
+impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, I> {
     /// Configures the name of the cookie used for the session.
     /// The default value is `"id"`.
     ///
@@ -452,6 +491,41 @@ impl<Store: SessionStore, C: CookieController> SessionManagerLayer<Store, C> {
         self
     }
 
+    /// Configures a custom async session ID extractor callback.
+    ///
+    /// The callback receives cloned extractor state and the request and must
+    /// return the request along with an optional session ID.
+    ///
+    /// ```rust
+    /// use http::Request;
+    /// use tower_sessions::{MemoryStore, SessionManagerLayer};
+    ///
+    /// let session_store = MemoryStore::default();
+    /// let session_service = SessionManagerLayer::new(session_store).with_id_extractor(
+    ///     (),
+    ///     |state: (), request: Request<_>| async move {
+    ///         let _ = state;
+    ///         (request, None)
+    ///     },
+    /// );
+    /// ```
+    pub fn with_id_extractor<State, F>(
+        self,
+        state: State,
+        extractor: F,
+    ) -> SessionManagerLayer<Store, C, StateIdExtractor<State, F>>
+    where
+        State: Clone + Send + 'static,
+        F: Clone + Send + 'static,
+    {
+        SessionManagerLayer {
+            session_store: self.session_store,
+            session_config: self.session_config,
+            cookie_controller: self.cookie_controller,
+            id_extractor: StateIdExtractor { state, extractor },
+        }
+    }
+
     /// Manages the session cookie via a signed interface.
     ///
     /// See [`SignedCookies`](tower_cookies::SignedCookies).
@@ -470,11 +544,12 @@ impl<Store: SessionStore, C: CookieController> SessionManagerLayer<Store, C> {
     /// let session_service = SessionManagerLayer::new(session_store).with_signed(key);
     /// ```
     #[cfg(feature = "signed")]
-    pub fn with_signed(self, key: Key) -> SessionManagerLayer<Store, SignedCookie> {
-        SessionManagerLayer::<Store, SignedCookie> {
+    pub fn with_signed(self, key: Key) -> SessionManagerLayer<Store, SignedCookie, I> {
+        SessionManagerLayer::<Store, SignedCookie, I> {
             session_store: self.session_store,
             session_config: self.session_config,
             cookie_controller: SignedCookie { key },
+            id_extractor: self.id_extractor,
         }
     }
 
@@ -496,11 +571,12 @@ impl<Store: SessionStore, C: CookieController> SessionManagerLayer<Store, C> {
     /// let session_service = SessionManagerLayer::new(session_store).with_private(key);
     /// ```
     #[cfg(feature = "private")]
-    pub fn with_private(self, key: Key) -> SessionManagerLayer<Store, PrivateCookie> {
-        SessionManagerLayer::<Store, PrivateCookie> {
+    pub fn with_private(self, key: Key) -> SessionManagerLayer<Store, PrivateCookie, I> {
+        SessionManagerLayer::<Store, PrivateCookie, I> {
             session_store: self.session_store,
             session_config: self.session_config,
             cookie_controller: PrivateCookie { key },
+            id_extractor: self.id_extractor,
         }
     }
 }
@@ -524,12 +600,15 @@ impl<Store: SessionStore> SessionManagerLayer<Store> {
             session_store: Arc::new(session_store),
             session_config,
             cookie_controller: PlaintextCookie,
+            id_extractor: NoopIdExtractor,
         }
     }
 }
 
-impl<S, Store: SessionStore, C: CookieController> Layer<S> for SessionManagerLayer<Store, C> {
-    type Service = CookieManager<SessionManager<S, Store, C>>;
+impl<S, Store: SessionStore, C: CookieController, I: Clone> Layer<S>
+    for SessionManagerLayer<Store, C, I>
+{
+    type Service = CookieManager<SessionManager<S, Store, C, I>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         let session_manager = SessionManager {
@@ -537,6 +616,7 @@ impl<S, Store: SessionStore, C: CookieController> Layer<S> for SessionManagerLay
             session_store: self.session_store.clone(),
             session_config: self.session_config.clone(),
             cookie_controller: self.cookie_controller.clone(),
+            id_extractor: self.id_extractor.clone(),
         };
 
         CookieManager::new(session_manager)
@@ -554,6 +634,22 @@ mod tests {
 
     use super::*;
     use crate::session::{Id, Record};
+
+    async fn cookie_id_extractor<ReqBody>(
+        _: (),
+        req: Request<ReqBody>,
+    ) -> (Request<ReqBody>, Option<Id>)
+    where
+        ReqBody: Send + 'static,
+    {
+        let session_id = req
+            .extensions()
+            .get::<Cookies>()
+            .and_then(|cookies| cookies.get("id"))
+            .and_then(|cookie| cookie.value().parse::<Id>().ok());
+
+        (req, session_id)
+    }
 
     async fn handler(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         let session = req
@@ -584,7 +680,8 @@ mod tests {
     #[tokio::test]
     async fn basic_service_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store);
+        let session_layer =
+            SessionManagerLayer::new(session_store).with_id_extractor((), cookie_id_extractor);
         let svc = ServiceBuilder::new()
             .layer(session_layer)
             .service_fn(handler);
@@ -795,6 +892,7 @@ mod tests {
     async fn expiry_on_session_end_always_save_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
         let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
             .with_expiry(Expiry::OnSessionEnd)
             .with_always_save(true);
         let mut svc = ServiceBuilder::new()
@@ -824,6 +922,7 @@ mod tests {
         let session_store = MemoryStore::default();
         let inactivity_duration = time::Duration::hours(2);
         let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
             .with_expiry(Expiry::OnInactivity(inactivity_duration))
             .with_always_save(true);
         let mut svc = ServiceBuilder::new()
@@ -854,6 +953,7 @@ mod tests {
         let session_store = MemoryStore::default();
         let expiry_time = time::OffsetDateTime::now_utc() + time::Duration::weeks(1);
         let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
             .with_expiry(Expiry::AtDateTime(expiry_time))
             .with_always_save(true);
         let mut svc = ServiceBuilder::new()
@@ -909,7 +1009,9 @@ mod tests {
     #[tokio::test]
     async fn secure_removal_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store.clone()).with_secure(true);
+        let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
+            .with_secure(true);
         let svc = ServiceBuilder::new()
             .layer(session_layer)
             .service_fn(handler);
@@ -919,7 +1021,9 @@ mod tests {
 
         let session_cookie = response_cookie(&res)?;
 
-        let flush_layer = SessionManagerLayer::new(session_store).with_secure(true);
+        let flush_layer = SessionManagerLayer::new(session_store)
+            .with_id_extractor((), cookie_id_extractor)
+            .with_secure(true);
         let flush_svc = ServiceBuilder::new()
             .layer(flush_layer)
             .service_fn(flush_handler);
@@ -938,7 +1042,9 @@ mod tests {
     #[tokio::test]
     async fn http_only_removal_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store.clone()).with_http_only(true);
+        let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
+            .with_http_only(true);
         let svc = ServiceBuilder::new()
             .layer(session_layer)
             .service_fn(handler);
@@ -947,7 +1053,9 @@ mod tests {
         let res = svc.oneshot(req).await?;
         let session_cookie = response_cookie(&res)?;
 
-        let flush_layer = SessionManagerLayer::new(session_store).with_http_only(true);
+        let flush_layer = SessionManagerLayer::new(session_store)
+            .with_id_extractor((), cookie_id_extractor)
+            .with_http_only(true);
         let flush_svc = ServiceBuilder::new()
             .layer(flush_layer)
             .service_fn(flush_handler);
@@ -966,7 +1074,9 @@ mod tests {
     #[tokio::test]
     async fn http_only_disabled_removal_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store.clone()).with_http_only(false);
+        let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
+            .with_http_only(false);
         let svc = ServiceBuilder::new()
             .layer(session_layer)
             .service_fn(handler);
@@ -975,7 +1085,9 @@ mod tests {
         let res = svc.oneshot(req).await?;
         let session_cookie = response_cookie(&res)?;
 
-        let flush_layer = SessionManagerLayer::new(session_store).with_http_only(false);
+        let flush_layer = SessionManagerLayer::new(session_store)
+            .with_id_extractor((), cookie_id_extractor)
+            .with_http_only(false);
         let flush_svc = ServiceBuilder::new()
             .layer(flush_layer)
             .service_fn(flush_handler);
@@ -994,7 +1106,9 @@ mod tests {
     #[tokio::test]
     async fn insecure_removal_test() -> anyhow::Result<()> {
         let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store.clone()).with_secure(false);
+        let session_layer = SessionManagerLayer::new(session_store.clone())
+            .with_id_extractor((), cookie_id_extractor)
+            .with_secure(false);
         let svc = ServiceBuilder::new()
             .layer(session_layer)
             .service_fn(handler);
@@ -1004,7 +1118,9 @@ mod tests {
 
         let session_cookie = response_cookie(&res)?;
 
-        let flush_layer = SessionManagerLayer::new(session_store).with_secure(false);
+        let flush_layer = SessionManagerLayer::new(session_store)
+            .with_id_extractor((), cookie_id_extractor)
+            .with_secure(false);
         let flush_svc = ServiceBuilder::new()
             .layer(flush_layer)
             .service_fn(flush_handler);
