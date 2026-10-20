@@ -36,8 +36,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["axum-core", "memory-store"]
 axum-core = ["tower-sessions-core/axum-core"]
 memory-store = ["tower-sessions-memory-store"]
-signed = ["tower-cookies/signed"]
-private = ["tower-cookies/private"]
+signed = []
+private = []
 
 [workspace.dependencies]
 tower-sessions = { version = "=0.15.0", path = ".", default-features = false }
@@ -62,7 +62,7 @@ tower-service = "0.3.2"
 tower-sessions-core = { workspace = true }
 tower-sessions-memory-store = { workspace = true, optional = true }
 tracing = { version = "0.1.40", features = ["log"] }
-tower-cookies = "0.11.0"
+cookie = "0.18.1"
 time = { version = "0.3.29", features = ["serde"] }
 
 [dev-dependencies]
@@ -84,7 +84,6 @@ time = "0.3.30"
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-test = "0.4.3"
 tower = { version = "0.5.0", features = ["util"] }
-tower-cookies = "0.11.0"
 tower-sessions-core = { workspace = true, features = ["deletion-task"] }
 
 [[example]]

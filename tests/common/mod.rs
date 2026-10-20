@@ -1,10 +1,13 @@
 use axum::{routing::get, Router};
 use axum_core::body::Body;
+use cookie::{self, Cookie, SameSite};
 use http::{header, HeaderMap};
 use http_body_util::BodyExt;
 use time::{Duration, OffsetDateTime};
-use tower_cookies::{cookie, Cookie, Cookies};
-use tower_sessions::{session::Id, Expiry, Session, SessionManagerLayer, SessionStore};
+use tower_sessions::{
+    session::Id, Expiry, ExtractedSessionId, IdWriteOperation, Session, SessionManagerLayer,
+    SessionStore,
+};
 
 fn routes() -> Router {
     Router::new()
@@ -71,7 +74,9 @@ pub fn build_app<Store: SessionStore + Clone>(
     max_age: Option<Duration>,
     domain: Option<String>,
 ) -> Router {
-    let mut session_manager = session_manager.with_id_extractor((), cookie_id_extractor);
+    let mut session_manager = session_manager
+        .with_id_extractor((), cookie_id_extractor)
+        .with_id_writer((), cookie_id_writer);
 
     if let Some(max_age) = max_age {
         session_manager = session_manager.with_expiry(Expiry::OnInactivity(max_age));
@@ -87,17 +92,47 @@ pub fn build_app<Store: SessionStore + Clone>(
 async fn cookie_id_extractor<ReqBody>(
     _: (),
     req: http::Request<ReqBody>,
-) -> (http::Request<ReqBody>, Option<Id>)
+) -> ExtractedSessionId<ReqBody>
 where
     ReqBody: Send + 'static,
 {
-    let session_id = req
-        .extensions()
-        .get::<Cookies>()
-        .and_then(|cookies| cookies.get("id"))
-        .and_then(|cookie| cookie.value().parse::<Id>().ok());
+    let maybe_cookie_value = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|header| header.to_str().ok())
+        .and_then(extract_id_cookie_value);
 
-    (req, session_id)
+    ExtractedSessionId {
+        request: req,
+        session_id: maybe_cookie_value
+            .as_deref()
+            .and_then(|value| value.parse::<Id>().ok()),
+        id_present: maybe_cookie_value.is_some(),
+    }
+}
+
+async fn cookie_id_writer(
+    _: (),
+    mut response: http::Response<axum_core::body::Body>,
+    operation: IdWriteOperation,
+) -> http::Response<axum_core::body::Body> {
+    let cookie = match operation {
+        IdWriteOperation::Set(cookie) | IdWriteOperation::Remove(cookie) => cookie,
+    };
+
+    if let Ok(value) = cookie.to_string().parse() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+
+    response
+}
+
+fn extract_id_cookie_value(header_value: &str) -> Option<String> {
+    header_value
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.split_once('=').filter(|(name, _)| *name == "id"))
+        .map(|(_, value)| value.to_owned())
 }
 
 pub async fn body_string(body: Body) -> String {
@@ -122,7 +157,7 @@ macro_rules! route_tests {
         use http::{header, Request, StatusCode};
         use time::Duration;
         use tower::ServiceExt;
-        use tower_cookies::{cookie::SameSite, Cookie};
+        use cookie::{Cookie, SameSite};
         use $crate::common::{body_string, get_session_cookie};
 
         #[tokio::test]

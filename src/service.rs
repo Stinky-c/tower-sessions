@@ -7,11 +7,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use cookie::{Cookie, SameSite};
 use http::{Request, Response};
 use time::OffsetDateTime;
-#[cfg(any(feature = "signed", feature = "private"))]
-use tower_cookies::Key;
-use tower_cookies::{cookie::SameSite, Cookie, CookieManager, Cookies};
 use tower_layer::Layer;
 use tower_service::Service;
 use tracing::Instrument;
@@ -21,73 +19,15 @@ use crate::{
     Session, SessionStore,
 };
 
-#[doc(hidden)]
-pub trait CookieController: Clone + Send + 'static {
-    fn get(&self, cookies: &Cookies, name: &str) -> Option<Cookie<'static>>;
-    fn add(&self, cookies: &Cookies, cookie: Cookie<'static>);
-    fn remove(&self, cookies: &Cookies, cookie: Cookie<'static>);
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct PlaintextCookie;
-
-impl CookieController for PlaintextCookie {
-    fn get(&self, cookies: &Cookies, name: &str) -> Option<Cookie<'static>> {
-        cookies.get(name).map(Cookie::into_owned)
-    }
-
-    fn add(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.add(cookie)
-    }
-
-    fn remove(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.remove(cookie)
-    }
-}
-
-#[doc(hidden)]
-#[cfg(feature = "signed")]
-#[derive(Debug, Clone)]
-pub struct SignedCookie {
-    key: Key,
-}
-
-#[cfg(feature = "signed")]
-impl CookieController for SignedCookie {
-    fn get(&self, cookies: &Cookies, name: &str) -> Option<Cookie<'static>> {
-        cookies.signed(&self.key).get(name).map(Cookie::into_owned)
-    }
-
-    fn add(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.signed(&self.key).add(cookie)
-    }
-
-    fn remove(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.signed(&self.key).remove(cookie)
-    }
-}
-
-#[doc(hidden)]
-#[cfg(feature = "private")]
-#[derive(Debug, Clone)]
-pub struct PrivateCookie {
-    key: Key,
-}
-
-#[cfg(feature = "private")]
-impl CookieController for PrivateCookie {
-    fn get(&self, cookies: &Cookies, name: &str) -> Option<Cookie<'static>> {
-        cookies.private(&self.key).get(name).map(Cookie::into_owned)
-    }
-
-    fn add(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.private(&self.key).add(cookie)
-    }
-
-    fn remove(&self, cookies: &Cookies, cookie: Cookie<'static>) {
-        cookies.private(&self.key).remove(cookie)
-    }
+/// The result of session ID extraction.
+#[derive(Debug)]
+pub struct ExtractedSessionId<ReqBody> {
+    /// The request to continue processing.
+    pub request: Request<ReqBody>,
+    /// The extracted session ID, when one was decoded.
+    pub session_id: Option<session::Id>,
+    /// Whether an ID-like value was present on the request.
+    pub id_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -146,14 +86,14 @@ impl Default for SessionConfig<'_> {
 pub struct SessionManager<
     S,
     Store: SessionStore,
-    C: CookieController = PlaintextCookie,
     I = NoopIdExtractor,
+    W = SetCookieHeaderWriter,
 > {
     inner: S,
     session_store: Arc<Store>,
     session_config: SessionConfig<'static>,
-    cookie_controller: C,
     id_extractor: I,
+    id_writer: W,
 }
 
 impl<S, Store: SessionStore> SessionManager<S, Store> {
@@ -163,8 +103,8 @@ impl<S, Store: SessionStore> SessionManager<S, Store> {
             inner,
             session_store: Arc::new(session_store),
             session_config: Default::default(),
-            cookie_controller: PlaintextCookie,
             id_extractor: NoopIdExtractor,
+            id_writer: SetCookieHeaderWriter,
         }
     }
 }
@@ -172,7 +112,7 @@ impl<S, Store: SessionStore> SessionManager<S, Store> {
 /// An extractor callback for loading a [`session::Id`] from a request.
 pub trait IdExtractor<ReqBody>: Clone + Send + 'static {
     /// The callback future.
-    type Future: Future<Output = (Request<ReqBody>, Option<session::Id>)> + Send + 'static;
+    type Future: Future<Output = ExtractedSessionId<ReqBody>> + Send + 'static;
 
     /// Extract an ID from the request and return the request for continued processing.
     fn extract(&self, request: Request<ReqBody>) -> Self::Future;
@@ -186,10 +126,14 @@ impl<ReqBody> IdExtractor<ReqBody> for NoopIdExtractor
 where
     ReqBody: Send + 'static,
 {
-    type Future = std::future::Ready<(Request<ReqBody>, Option<session::Id>)>;
+    type Future = std::future::Ready<ExtractedSessionId<ReqBody>>;
 
     fn extract(&self, request: Request<ReqBody>) -> Self::Future {
-        std::future::ready((request, None))
+        std::future::ready(ExtractedSessionId {
+            request,
+            session_id: None,
+            id_present: false,
+        })
     }
 }
 
@@ -205,7 +149,7 @@ where
     ReqBody: Send + 'static,
     State: Clone + Send + 'static,
     F: Fn(State, Request<ReqBody>) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = (Request<ReqBody>, Option<session::Id>)> + Send + 'static,
+    Fut: Future<Output = ExtractedSessionId<ReqBody>> + Send + 'static,
 {
     type Future = Fut;
 
@@ -214,8 +158,89 @@ where
     }
 }
 
-impl<ReqBody, ResBody, S, Store: SessionStore, C: CookieController, I: IdExtractor<ReqBody>>
-    Service<Request<ReqBody>> for SessionManager<S, Store, C, I>
+/// A write operation for session IDs on outbound responses.
+#[derive(Debug, Clone)]
+pub enum IdWriteOperation {
+    /// Set an ID representation on the response.
+    Set(Cookie<'static>),
+    /// Remove the existing ID representation from the response.
+    Remove(Cookie<'static>),
+}
+
+/// A callback for writing session IDs to responses.
+pub trait IdWriter<ResBody>: Clone + Send + 'static {
+    /// The callback future.
+    type Future: Future<Output = Response<ResBody>> + Send + 'static;
+
+    /// Apply ID output changes to the response.
+    fn write(&self, response: Response<ResBody>, operation: IdWriteOperation) -> Self::Future;
+}
+
+/// A default no-op ID writer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopIdWriter;
+
+impl<ResBody> IdWriter<ResBody> for NoopIdWriter
+where
+    ResBody: Send + 'static,
+{
+    type Future = std::future::Ready<Response<ResBody>>;
+
+    fn write(&self, response: Response<ResBody>, _operation: IdWriteOperation) -> Self::Future {
+        std::future::ready(response)
+    }
+
+    /// A default response writer that appends `Set-Cookie` headers.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct SetCookieHeaderWriter;
+
+    impl<ResBody> IdWriter<ResBody> for SetCookieHeaderWriter
+    where
+        ResBody: Send + 'static,
+    {
+        type Future = std::future::Ready<Response<ResBody>>;
+
+        fn write(&self, mut response: Response<ResBody>, operation: IdWriteOperation) -> Self::Future {
+            let cookie = match operation {
+                IdWriteOperation::Set(cookie) | IdWriteOperation::Remove(cookie) => cookie,
+            };
+
+            if let Ok(value) = cookie.to_string().parse() {
+                response
+                    .headers_mut()
+                    .append(http::header::SET_COOKIE, value);
+            } else {
+                tracing::error!("failed to encode Set-Cookie header");
+            }
+
+            std::future::ready(response)
+        }
+    }
+}
+
+/// An ID writer that receives both user state and response.
+#[derive(Debug, Clone)]
+pub struct StateIdWriter<State, F> {
+    state: State,
+    writer: F,
+}
+
+impl<ResBody, State, F, Fut> IdWriter<ResBody> for StateIdWriter<State, F>
+where
+    ResBody: Send + 'static,
+    State: Clone + Send + 'static,
+    F: Fn(State, Response<ResBody>, IdWriteOperation) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<ResBody>> + Send + 'static,
+{
+    type Future = Fut;
+
+    fn write(&self, response: Response<ResBody>, operation: IdWriteOperation) -> Self::Future {
+        (self.writer)(self.state.clone(), response, operation)
+    }
+}
+
+impl<ReqBody, ResBody, S, Store: SessionStore, I: IdExtractor<ReqBody>, W: IdWriter<ResBody>>
+    Service<Request<ReqBody>> for SessionManager<S, Store, I, W>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
@@ -236,8 +261,8 @@ where
 
         let session_store = self.session_store.clone();
         let session_config = self.session_config.clone();
-        let cookie_controller = self.cookie_controller.clone();
         let id_extractor = self.id_extractor.clone();
+        let id_writer = self.id_writer.clone();
 
         // Because the inner service can panic until ready, we need to ensure we only
         // use the ready service.
@@ -248,17 +273,10 @@ where
 
         Box::pin(
             async move {
-                let (mut req, extracted_session_id) = id_extractor.extract(req).await;
-                let had_extracted_session_id = extracted_session_id.is_some();
-
-                let Some(cookies) = req.extensions().get::<_>().cloned() else {
-                    // In practice this should never happen because we wrap `CookieManager`
-                    // directly.
-                    tracing::error!("missing cookies request extension");
-                    return Ok(Response::default());
-                };
-                let request_had_session_cookie =
-                    cookie_controller.get(&cookies, &session_config.name).is_some();
+                let extracted = id_extractor.extract(req).await;
+                let mut req = extracted.request;
+                let extracted_session_id = extracted.session_id;
+                let request_had_session_cookie = extracted.id_present;
 
                 let session =
                     Session::new(extracted_session_id, session_store, session_config.expiry);
@@ -278,7 +296,7 @@ where
                 );
 
                 match session.id() {
-                    _ if empty && (had_extracted_session_id || request_had_session_cookie) => {
+                    _ if empty && request_had_session_cookie => {
                         tracing::debug!("removing session cookie");
 
                         let mut cookie = Cookie::new(session_config.name.to_string(), "");
@@ -288,7 +306,10 @@ where
                         }
                         cookie.set_secure(session_config.secure);
                         cookie.set_http_only(session_config.http_only);
-                        cookie_controller.remove(&cookies, cookie);
+                        let res = id_writer
+                            .write(res, IdWriteOperation::Remove(cookie.into_owned()))
+                            .await;
+                        return Ok(res);
                     }
 
                     _ if (modified || session_config.always_save)
@@ -316,7 +337,10 @@ where
                         let session_cookie = session_config.build_cookie(session_id, expiry);
 
                         tracing::debug!("adding session cookie");
-                        cookie_controller.add(&cookies, session_cookie);
+                        let res = id_writer
+                            .write(res, IdWriteOperation::Set(session_cookie.into_owned()))
+                            .await;
+                        return Ok(res);
                     }
 
                     _ => (),
@@ -333,16 +357,16 @@ where
 #[derive(Debug, Clone)]
 pub struct SessionManagerLayer<
     Store: SessionStore,
-    C: CookieController = PlaintextCookie,
     I = NoopIdExtractor,
+    W = SetCookieHeaderWriter,
 > {
     session_store: Arc<Store>,
     session_config: SessionConfig<'static>,
-    cookie_controller: C,
     id_extractor: I,
+    id_writer: W,
 }
 
-impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, I> {
+impl<Store: SessionStore, I, W> SessionManagerLayer<Store, I, W> {
     /// Configures the name of the cookie used for the session.
     /// The default value is `"id"`.
     ///
@@ -509,7 +533,11 @@ impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, 
     ///     (),
     ///     |state: (), request: Request<()>| async move {
     ///         let _ = state;
-    ///         (request, None::<tower_sessions::session::Id>)
+    ///         tower_sessions::ExtractedSessionId {
+    ///             request,
+    ///             session_id: None::<tower_sessions::session::Id>,
+    ///             id_present: false,
+    ///         }
     ///     },
     /// );
     /// ```
@@ -517,7 +545,7 @@ impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, 
         self,
         state: State,
         extractor: F,
-    ) -> SessionManagerLayer<Store, C, StateIdExtractor<State, F>>
+    ) -> SessionManagerLayer<Store, StateIdExtractor<State, F>, W>
     where
         State: Clone + Send + 'static,
         F: Clone + Send + 'static,
@@ -525,62 +553,44 @@ impl<Store: SessionStore, C: CookieController, I> SessionManagerLayer<Store, C, 
         SessionManagerLayer {
             session_store: self.session_store,
             session_config: self.session_config,
-            cookie_controller: self.cookie_controller,
+            id_writer: self.id_writer,
             id_extractor: StateIdExtractor { state, extractor },
         }
     }
 
-    /// Manages the session cookie via a signed interface.
+    /// Configures a custom async session ID write callback.
     ///
-    /// See [`SignedCookies`](tower_cookies::SignedCookies).
-    ///
-    /// ```rust
-    /// use tower_sessions::{cookie::Key, MemoryStore, SessionManagerLayer};
-    ///
-    /// # /*
-    /// let key = { /* a cryptographically random key >= 64 bytes */ };
-    /// # */
-    /// # let key: &Vec<u8> = &(0..64).collect();
-    /// # let key: &[u8] = &key[..];
-    /// # let key = Key::try_from(key).unwrap();
-    ///
-    /// let session_store = MemoryStore::default();
-    /// let session_service = SessionManagerLayer::new(session_store).with_signed(key);
-    /// ```
-    #[cfg(feature = "signed")]
-    pub fn with_signed(self, key: Key) -> SessionManagerLayer<Store, SignedCookie, I> {
-        SessionManagerLayer::<Store, SignedCookie, I> {
-            session_store: self.session_store,
-            session_config: self.session_config,
-            cookie_controller: SignedCookie { key },
-            id_extractor: self.id_extractor,
-        }
-    }
-
-    /// Manages the session cookie via an encrypted interface.
-    ///
-    /// See [`PrivateCookies`](tower_cookies::PrivateCookies).
+    /// The callback receives cloned writer state, the response, and a write
+    /// operation for setting or removing the ID representation.
     ///
     /// ```rust
-    /// use tower_sessions::{cookie::Key, MemoryStore, SessionManagerLayer};
-    ///
-    /// # /*
-    /// let key = { /* a cryptographically random key >= 64 bytes */ };
-    /// # */
-    /// # let key: &Vec<u8> = &(0..64).collect();
-    /// # let key: &[u8] = &key[..];
-    /// # let key = Key::try_from(key).unwrap();
+    /// use axum::body::Body;
+    /// use http::Response;
+    /// use tower_sessions::{IdWriteOperation, MemoryStore, SessionManagerLayer};
     ///
     /// let session_store = MemoryStore::default();
-    /// let session_service = SessionManagerLayer::new(session_store).with_private(key);
+    /// let session_service = SessionManagerLayer::new(session_store).with_id_writer(
+    ///     (),
+    ///     |state: (), response: Response<Body>, operation: IdWriteOperation| async move {
+    ///         let _ = (state, operation);
+    ///         response
+    ///     },
+    /// );
     /// ```
-    #[cfg(feature = "private")]
-    pub fn with_private(self, key: Key) -> SessionManagerLayer<Store, PrivateCookie, I> {
-        SessionManagerLayer::<Store, PrivateCookie, I> {
+    pub fn with_id_writer<State, F>(
+        self,
+        state: State,
+        writer: F,
+    ) -> SessionManagerLayer<Store, I, StateIdWriter<State, F>>
+    where
+        State: Clone + Send + 'static,
+        F: Clone + Send + 'static,
+    {
+        SessionManagerLayer {
             session_store: self.session_store,
             session_config: self.session_config,
-            cookie_controller: PrivateCookie { key },
             id_extractor: self.id_extractor,
+            id_writer: StateIdWriter { state, writer },
         }
     }
 }
@@ -603,27 +613,24 @@ impl<Store: SessionStore> SessionManagerLayer<Store> {
         Self {
             session_store: Arc::new(session_store),
             session_config,
-            cookie_controller: PlaintextCookie,
             id_extractor: NoopIdExtractor,
+            id_writer: SetCookieHeaderWriter,
         }
     }
 }
 
-impl<S, Store: SessionStore, C: CookieController, I: Clone> Layer<S>
-    for SessionManagerLayer<Store, C, I>
+impl<S, Store: SessionStore, I: Clone, W: Clone> Layer<S> for SessionManagerLayer<Store, I, W>
 {
-    type Service = CookieManager<SessionManager<S, Store, C, I>>;
+    type Service = SessionManager<S, Store, I, W>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        let session_manager = SessionManager {
+        SessionManager {
             inner,
             session_store: self.session_store.clone(),
             session_config: self.session_config.clone(),
-            cookie_controller: self.cookie_controller.clone(),
             id_extractor: self.id_extractor.clone(),
-        };
-
-        CookieManager::new(session_manager)
+            id_writer: self.id_writer.clone(),
+        }
     }
 }
 
@@ -642,17 +649,23 @@ mod tests {
     async fn cookie_id_extractor<ReqBody>(
         _: (),
         req: Request<ReqBody>,
-    ) -> (Request<ReqBody>, Option<Id>)
+    ) -> ExtractedSessionId<ReqBody>
     where
         ReqBody: Send + 'static,
     {
-        let session_id = req
-            .extensions()
-            .get::<Cookies>()
-            .and_then(|cookies| cookies.get("id"))
-            .and_then(|cookie| cookie.value().parse::<Id>().ok());
+        let maybe_cookie_value = req
+            .headers()
+            .get(http::header::COOKIE)
+            .and_then(|header| header.to_str().ok())
+            .and_then(extract_id_cookie_value);
 
-        (req, session_id)
+        ExtractedSessionId {
+            request: req,
+            session_id: maybe_cookie_value
+                .as_deref()
+                .and_then(|value| value.parse::<Id>().ok()),
+            id_present: maybe_cookie_value.is_some(),
+        }
     }
 
     async fn handler(req: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -1173,42 +1186,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "signed")]
-    #[tokio::test]
-    async fn signed_test() -> anyhow::Result<()> {
-        let key = Key::generate();
-        let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store).with_signed(key);
-        let svc = ServiceBuilder::new()
-            .layer(session_layer)
-            .service_fn(handler);
-
-        let req = Request::builder().body(Body::empty())?;
-        let res = svc.oneshot(req).await?;
-
-        assert!(res.headers().get(http::header::SET_COOKIE).is_some());
-
-        Ok(())
-    }
-
-    #[cfg(feature = "private")]
-    #[tokio::test]
-    async fn private_test() -> anyhow::Result<()> {
-        let key = Key::generate();
-        let session_store = MemoryStore::default();
-        let session_layer = SessionManagerLayer::new(session_store).with_private(key);
-        let svc = ServiceBuilder::new()
-            .layer(session_layer)
-            .service_fn(handler);
-
-        let req = Request::builder().body(Body::empty())?;
-        let res = svc.oneshot(req).await?;
-
-        assert!(res.headers().get(http::header::SET_COOKIE).is_some());
-
-        Ok(())
-    }
-
     fn cookie_value_matches<F>(res: &Response<Body>, matcher: F) -> bool
     where
         F: FnOnce(&str) -> bool,
@@ -1229,6 +1206,14 @@ mod tests {
 
     fn cookie_request_value(cookie: &Cookie<'_>) -> String {
         format!("{}={}", cookie.name(), cookie.value())
+    }
+
+    fn extract_id_cookie_value(header: &str) -> Option<String> {
+        header
+            .split(';')
+            .map(str::trim)
+            .find_map(|pair| pair.split_once('=').filter(|(name, _)| *name == "id"))
+            .map(|(_, value)| value.to_owned())
     }
 
     fn cookie_has_expected_max_age(res: &Response<Body>, expected_value: i64) -> bool {
